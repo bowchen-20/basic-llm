@@ -46,11 +46,21 @@ class BPETokenizer:
         self._special_tokens: list[str] = special_tokens or []
         self._special: dict[str, int] = {}  # token string -> id
 
+    def __len__(self) -> int:
+        return self.vocab_size
+
+    def __repr__(self) -> str:
+        return (
+            f"BPETokenizer(vocab_size={self.vocab_size}, "
+            f"merges={len(self.merges)}, "
+            f"special={list(self._special)})"
+        )
+
     # ------------------------------------------------------------------
     # training
     # ------------------------------------------------------------------
 
-    def train(self, text: str, vocab_size: int) -> None:
+    def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
         assert vocab_size >= 256, "vocab_size must be at least 256 (byte base vocab)"
 
         # Pre-tokenize: split into chunks, then encode each chunk to bytes.
@@ -76,6 +86,13 @@ class BPETokenizer:
             self.merges[best] = new_id
             self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
 
+            if verbose:
+                try:
+                    display = repr(self.vocab[new_id].decode("utf-8"))
+                except UnicodeDecodeError:
+                    display = repr(self.vocab[new_id])
+                print(f"  [{i + 1:4d}/{num_merges}] {new_id} -> {display}  (freq={counts[best]})")
+
         # Special tokens are assigned IDs above all merge tokens.
         for tok in self._special_tokens:
             sid = len(self.vocab)
@@ -83,6 +100,21 @@ class BPETokenizer:
             self.vocab[sid] = tok.encode("utf-8")
 
         self.vocab_size = len(self.vocab)
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str,
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+        verbose: bool = False,
+    ) -> "BPETokenizer":
+        """Train a new tokenizer on the contents of a text file."""
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        tok = cls(special_tokens=special_tokens)
+        tok.train(text, vocab_size, verbose=verbose)
+        return tok
 
     # ------------------------------------------------------------------
     # encode / decode
@@ -115,19 +147,126 @@ class BPETokenizer:
                     ids.extend(self._bpe_encode_chunk(list(chunk.encode("utf-8"))))
         return ids
 
+    def encode_batch(
+        self,
+        texts: list[str],
+        allowed_special: set[str] | None = None,
+    ) -> list[list[int]]:
+        """Encode a list of strings, returning a list of token id lists."""
+        return [self.encode(t, allowed_special=allowed_special) for t in texts]
+
+    def encode_plus(
+        self,
+        text: str,
+        max_length: int | None = None,
+        padding: bool = False,
+        truncation: bool = False,
+        allowed_special: set[str] | None = None,
+    ) -> dict:
+        """
+        Encode with optional truncation and padding.
+
+        Returns {"input_ids": [...], "attention_mask": [...]}.
+        Padding uses the <|pad|> special token id when present, else 0.
+        attention_mask is 1 for real tokens and 0 for padding.
+        """
+        ids = self.encode(text, allowed_special=allowed_special)
+
+        if truncation and max_length is not None:
+            ids = ids[:max_length]
+
+        attention_mask = [1] * len(ids)
+
+        if padding and max_length is not None:
+            pad_id = self._special.get("<|pad|>", 0)
+            pad_len = max_length - len(ids)
+            if pad_len > 0:
+                ids = ids + [pad_id] * pad_len
+                attention_mask = attention_mask + [0] * pad_len
+
+        return {"input_ids": ids, "attention_mask": attention_mask}
+
+    def encode_with_offsets(
+        self, text: str
+    ) -> tuple[list[int], list[tuple[int, int]]]:
+        """
+        Encode text and return (ids, offsets).
+
+        offsets[i] is the (char_start, char_end) span in the original string
+        for token ids[i]. Useful for token-to-character alignment in NER/QA.
+        """
+        ids: list[int] = []
+        offsets: list[tuple[int, int]] = []
+        text_encoded = text.encode("utf-8")
+
+        for m in _PRETOK.finditer(text):
+            chunk = m.group()
+            chunk_start_byte = len(text[: m.start()].encode("utf-8"))
+            chunk_bytes = chunk.encode("utf-8")
+            chunk_ids = self._bpe_encode_chunk(list(chunk_bytes))
+
+            byte_cursor = 0
+            for tid in chunk_ids:
+                n = len(self.vocab[tid])
+                char_start = len(
+                    text_encoded[: chunk_start_byte + byte_cursor].decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+                char_end = len(
+                    text_encoded[: chunk_start_byte + byte_cursor + n].decode(
+                        "utf-8", errors="replace"
+                    )
+                )
+                offsets.append((char_start, char_end))
+                byte_cursor += n
+
+            ids.extend(chunk_ids)
+
+        return ids, offsets
+
+    def count_tokens(self, text: str, allowed_special: set[str] | None = None) -> int:
+        """Return token count without materialising the full list."""
+        return len(self.encode(text, allowed_special=allowed_special))
+
     def decode(self, tokens: list[int]) -> str:
         raw = b"".join(self.vocab[t] for t in tokens)
         return raw.decode("utf-8", errors="replace")
 
     # ------------------------------------------------------------------
-    # inspection
+    # token lookup
+    # ------------------------------------------------------------------
+
+    def token_to_id(self, token: str) -> int | None:
+        """Return the id for a token string, or None if not in vocab."""
+        bs = token.encode("utf-8")
+        for tid, tbytes in self.vocab.items():
+            if tbytes == bs:
+                return tid
+        return None
+
+    def id_to_token(self, token_id: int) -> str | None:
+        """Return the string for a token id, or None if not in vocab."""
+        bts = self.vocab.get(token_id)
+        if bts is None:
+            return None
+        try:
+            return bts.decode("utf-8")
+        except UnicodeDecodeError:
+            return repr(bts)
+
+    # ------------------------------------------------------------------
+    # inspection / stats
     # ------------------------------------------------------------------
 
     def show_vocab(self, n: int = 30) -> None:
         """Print the n most recently learned merge tokens plus any special tokens."""
         special_ids = set(self._special.values())
-        merged = [(tid, bts) for tid, bts in self.vocab.items()
-                  if tid >= 256 and tid not in special_ids]
+        merged = [
+            (tid, bts)
+            for tid, bts in self.vocab.items()
+            if tid >= 256 and tid not in special_ids
+        ]
         for tid, bts in merged[-n:]:
             try:
                 display = repr(bts.decode("utf-8"))
@@ -136,6 +275,32 @@ class BPETokenizer:
             print(f"  {tid:5d}: {display}")
         for s, sid in self._special.items():
             print(f"  {sid:5d}: {repr(s)}  <special>")
+
+    def vocab_stats(self) -> None:
+        """Print a summary of vocabulary composition and token length distribution."""
+        special_ids = set(self._special.values())
+        merge_tokens = [
+            v for k, v in self.vocab.items() if k >= 256 and k not in special_ids
+        ]
+        lengths = [len(v) for v in merge_tokens]
+
+        print(f"vocab_size     : {self.vocab_size}")
+        print(f"base tokens    : 256  (raw bytes 0-255)")
+        print(f"merge tokens   : {len(merge_tokens)}")
+        print(f"special tokens : {len(self._special)}  {list(self._special)}")
+        if lengths:
+            print(f"avg merge len  : {sum(lengths) / len(lengths):.2f} bytes")
+            print(f"max merge len  : {max(lengths)} bytes")
+
+    def compression_ratio(self, text: str) -> float:
+        """
+        Bytes per token on this text.
+        Higher means the vocab compresses the corpus more efficiently.
+        Byte-level baseline is 1.0; a well-trained BPE on English text is ~4-5.
+        """
+        n_bytes = len(text.encode("utf-8"))
+        n_tokens = self.count_tokens(text)
+        return n_bytes / n_tokens if n_tokens else 0.0
 
     # ------------------------------------------------------------------
     # persistence
