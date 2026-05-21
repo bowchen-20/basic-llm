@@ -45,6 +45,7 @@ class BPETokenizer:
         self.vocab_size: int = 0
         self._special_tokens: list[str] = special_tokens or []
         self._special: dict[str, int] = {}  # token string -> id
+        self._bytes_to_id: dict[bytes, int] = {}  # reverse lookup, built after train/load
 
     def __len__(self) -> int:
         return self.vocab_size
@@ -56,6 +57,9 @@ class BPETokenizer:
             f"special={list(self._special)})"
         )
 
+    def __contains__(self, token: str) -> bool:
+        return token.encode("utf-8") in self._bytes_to_id
+
     # ------------------------------------------------------------------
     # training
     # ------------------------------------------------------------------
@@ -63,11 +67,16 @@ class BPETokenizer:
     def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
         assert vocab_size >= 256, "vocab_size must be at least 256 (byte base vocab)"
 
-        # Pre-tokenize: split into chunks, then encode each chunk to bytes.
-        # BPE merges happen independently within each chunk — never across them.
-        chunks: list[list[int]] = [
-            list(chunk.encode("utf-8")) for chunk in _PRETOK.findall(text)
-        ]
+        # Count frequency of each unique pre-token chunk.
+        # Working on unique chunks (weighted by frequency) instead of the full
+        # flat sequence is the classic BPE speedup: O(unique_chunks × merges)
+        # rather than O(total_chunks × merges).
+        freq: dict[tuple[int, ...], int] = defaultdict(int)
+        for chunk in _PRETOK.findall(text):
+            freq[tuple(chunk.encode("utf-8"))] += 1
+
+        words: list[list[int]] = [list(k) for k in freq]
+        freqs: list[int] = [freq[k] for k in freq]
 
         self.vocab = {i: bytes([i]) for i in range(256)}
         self.merges = {}
@@ -75,14 +84,14 @@ class BPETokenizer:
         num_merges = vocab_size - 256 - len(self._special_tokens)
         for i in range(num_merges):
             counts: dict[tuple[int, int], int] = defaultdict(int)
-            for chunk in chunks:
-                for pair in zip(chunk, chunk[1:]):
-                    counts[pair] += 1
+            for word, f in zip(words, freqs):
+                for pair in zip(word, word[1:]):
+                    counts[pair] += f  # weight by word frequency
             if not counts:
                 break
             best = max(counts, key=counts.__getitem__)
             new_id = 256 + i
-            chunks = [self._merge(chunk, best, new_id) for chunk in chunks]
+            words = [self._merge(word, best, new_id) for word in words]
             self.merges[best] = new_id
             self.vocab[new_id] = self.vocab[best[0]] + self.vocab[best[1]]
 
@@ -100,6 +109,7 @@ class BPETokenizer:
             self.vocab[sid] = tok.encode("utf-8")
 
         self.vocab_size = len(self.vocab)
+        self._bytes_to_id = {v: k for k, v in self.vocab.items()}
 
     @classmethod
     def from_file(
@@ -147,6 +157,10 @@ class BPETokenizer:
                     ids.extend(self._bpe_encode_chunk(list(chunk.encode("utf-8"))))
         return ids
 
+    def tokenize(self, text: str, allowed_special: set[str] | None = None) -> list[str]:
+        """Encode text and return token strings instead of ids — useful for visualization."""
+        return [self.id_to_token(i) or repr(self.vocab[i]) for i in self.encode(text, allowed_special)]
+
     def encode_batch(
         self,
         texts: list[str],
@@ -154,6 +168,42 @@ class BPETokenizer:
     ) -> list[list[int]]:
         """Encode a list of strings, returning a list of token id lists."""
         return [self.encode(t, allowed_special=allowed_special) for t in texts]
+
+    def encode_batch_plus(
+        self,
+        texts: list[str],
+        max_length: int | None = None,
+        padding: bool = True,
+        truncation: bool = False,
+        allowed_special: set[str] | None = None,
+    ) -> dict:
+        """
+        Encode a batch of strings with consistent length.
+
+        Returns {"input_ids": [[...], ...], "attention_mask": [[...], ...]}.
+        When max_length is None, pads to the longest sequence in the batch.
+        Padding uses the <|pad|> special token id when present, else 0.
+        """
+        encoded = [self.encode(t, allowed_special=allowed_special) for t in texts]
+
+        if truncation and max_length is not None:
+            encoded = [ids[:max_length] for ids in encoded]
+
+        target_len = max_length if max_length is not None else max((len(ids) for ids in encoded), default=0)
+        pad_id = self._special.get("<|pad|>", 0)
+
+        input_ids: list[list[int]] = []
+        attention_mask: list[list[int]] = []
+        for ids in encoded:
+            mask = [1] * len(ids)
+            if padding and len(ids) < target_len:
+                pad_len = target_len - len(ids)
+                ids = ids + [pad_id] * pad_len
+                mask = mask + [0] * pad_len
+            input_ids.append(ids)
+            attention_mask.append(mask)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     def encode_plus(
         self,
@@ -233,17 +283,17 @@ class BPETokenizer:
         raw = b"".join(self.vocab[t] for t in tokens)
         return raw.decode("utf-8", errors="replace")
 
+    def decode_batch(self, batch: list[list[int]]) -> list[str]:
+        """Decode a list of token id lists into a list of strings."""
+        return [self.decode(ids) for ids in batch]
+
     # ------------------------------------------------------------------
     # token lookup
     # ------------------------------------------------------------------
 
     def token_to_id(self, token: str) -> int | None:
         """Return the id for a token string, or None if not in vocab."""
-        bs = token.encode("utf-8")
-        for tid, tbytes in self.vocab.items():
-            if tbytes == bs:
-                return tid
-        return None
+        return self._bytes_to_id.get(token.encode("utf-8"))
 
     def id_to_token(self, token_id: int) -> str | None:
         """Return the string for a token id, or None if not in vocab."""
@@ -326,6 +376,7 @@ class BPETokenizer:
         self._special = {s: sid for s, sid in data.get("special", {}).items()}
         self._special_tokens = list(self._special.keys())
         self.vocab_size = len(self.vocab)
+        self._bytes_to_id = {v: k for k, v in self.vocab.items()}
 
     # ------------------------------------------------------------------
     # internals
