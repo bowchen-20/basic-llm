@@ -3,12 +3,13 @@ from dataclasses import dataclass, asdict
 
 @dataclass
 class ModelConfig:
-    vocab_size: int  = 256
-    n_embd:     int  = 128
-    n_head:     int  = 4
-    n_layer:    int  = 4
-    block_size: int  = 128
+    vocab_size: int   = 256
+    n_embd:     int   = 128
+    n_head:     int   = 4
+    n_layer:    int   = 4
+    block_size: int   = 128
     dropout:    float = 0.0
+    use_rope:   bool  = True   # rotary positional embeddings (vs learned)
 
     def to_dict(self) -> dict:
         return asdict(self)

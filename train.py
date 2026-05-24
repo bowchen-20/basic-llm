@@ -1,11 +1,13 @@
 import math
+import os
 import torch
 from tokenizer import CharTokenizer
 from model import TransformerLM
 from config import ModelConfig, TrainConfig
+from data import build_datasets, make_loader
 
 # ---------------------------------------------------------------------------
-# Config — edit these to change the run
+# Config
 # ---------------------------------------------------------------------------
 mcfg = ModelConfig(
     n_embd     = 128,
@@ -13,6 +15,7 @@ mcfg = ModelConfig(
     n_layer    = 4,
     block_size = 128,
     dropout    = 0.0,
+    use_rope   = True,
 )
 
 tcfg = TrainConfig(
@@ -20,7 +23,7 @@ tcfg = TrainConfig(
     out_path         = "checkpoint.pt",
     batch_size       = 32,
     block_size       = 128,
-    grad_accum_steps = 1,       # increase to simulate larger effective batch
+    grad_accum_steps = 1,
     max_iters        = 5000,
     warmup_iters     = 200,
     lr_max           = 3e-4,
@@ -29,10 +32,10 @@ tcfg = TrainConfig(
     grad_clip        = 1.0,
     eval_interval    = 500,
     eval_iters       = 100,
-    dtype            = "float32",  # "bfloat16" for GPU speedup
+    dtype            = "float32",
 )
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE    = "cuda" if torch.cuda.is_available() else "cpu"
 AMP_DTYPE = torch.bfloat16 if tcfg.dtype == "bfloat16" else torch.float32
 USE_AMP   = (tcfg.dtype == "bfloat16") and (DEVICE == "cuda")
 
@@ -48,50 +51,40 @@ except FileNotFoundError:
 tokenizer = CharTokenizer(text)
 mcfg.vocab_size = tokenizer.vocab_size
 
-data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-n = int(0.9 * len(data))
-train_data, val_data = data[:n], data[n:]
-
-
-def get_batch(split: str) -> tuple[torch.Tensor, torch.Tensor]:
-    d  = train_data if split == "train" else val_data
-    ix = torch.randint(len(d) - tcfg.block_size, (tcfg.batch_size,))
-    x  = torch.stack([d[i : i + tcfg.block_size]     for i in ix])
-    y  = torch.stack([d[i + 1 : i + tcfg.block_size + 1] for i in ix])
-    return x.to(DEVICE), y.to(DEVICE)
+train_ds, val_ds = build_datasets(text, tokenizer, tcfg.block_size)
+train_loader = make_loader(train_ds, tcfg.batch_size, shuffle=True)
+val_loader   = make_loader(val_ds,   tcfg.batch_size, shuffle=False)
 
 
 @torch.no_grad()
 def estimate_loss(model: TransformerLM) -> dict[str, float]:
     model.eval()
     out = {}
-    for split in ("train", "val"):
-        losses = torch.zeros(tcfg.eval_iters)
-        for k in range(tcfg.eval_iters):
-            x, y = get_batch(split)
+    for split, loader in [("train", train_loader), ("val", val_loader)]:
+        losses: list[float] = []
+        for i, (x, y) in enumerate(loader):
+            if i >= tcfg.eval_iters:
+                break
+            x, y = x.to(DEVICE), y.to(DEVICE)
             with torch.amp.autocast(device_type=DEVICE, dtype=AMP_DTYPE, enabled=USE_AMP):
                 _, loss, _ = model(x, y)
-            losses[k] = loss.item()
-        out[split] = losses.mean().item()
+            losses.append(loss.item())
+        out[split] = sum(losses) / len(losses)
     model.train()
     return out
 
 
 def get_lr(step: int) -> float:
-    """Linear warmup then cosine decay."""
     if step < tcfg.warmup_iters:
         return tcfg.lr_max * step / tcfg.warmup_iters
     t = (step - tcfg.warmup_iters) / max(1, tcfg.max_iters - tcfg.warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * t))
-    return tcfg.lr_min + coeff * (tcfg.lr_max - tcfg.lr_min)
+    return tcfg.lr_min + 0.5 * (tcfg.lr_max - tcfg.lr_min) * (1.0 + math.cos(math.pi * t))
 
 
 # ---------------------------------------------------------------------------
 # Model + optimiser
 # ---------------------------------------------------------------------------
 model = TransformerLM(mcfg).to(DEVICE)
-print(f"Parameters: {model.num_params():,}  |  device: {DEVICE}  |  dtype: {tcfg.dtype}")
-
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr           = tcfg.lr_max,
@@ -101,15 +94,39 @@ optimizer = torch.optim.AdamW(
 scaler = torch.amp.GradScaler(enabled=USE_AMP)
 
 # ---------------------------------------------------------------------------
+# Resume from checkpoint if one exists
+# ---------------------------------------------------------------------------
+start_step = 0
+if os.path.exists(tcfg.out_path):
+    print(f"Resuming from {tcfg.out_path} ...")
+    ckpt = torch.load(tcfg.out_path, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    start_step = ckpt.get("step", 0) + 1
+    print(f"Resumed at step {start_step}")
+else:
+    print(f"Parameters: {model.num_params():,}  |  device: {DEVICE}  |  dtype: {tcfg.dtype}")
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-for step in range(tcfg.max_iters):
-    # Update LR
+train_iter = iter(train_loader)
+
+def next_batch() -> tuple[torch.Tensor, torch.Tensor]:
+    global train_iter
+    try:
+        x, y = next(train_iter)
+    except StopIteration:
+        train_iter = iter(train_loader)
+        x, y = next(train_iter)
+    return x.to(DEVICE), y.to(DEVICE)
+
+
+for step in range(start_step, tcfg.max_iters):
     lr = get_lr(step)
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
-    # Periodic eval
     if step % tcfg.eval_interval == 0:
         losses = estimate_loss(model)
         print(
@@ -117,11 +134,9 @@ for step in range(tcfg.max_iters):
             f"train={losses['train']:.4f}  val={losses['val']:.4f}"
         )
 
-    # Gradient accumulation: accumulate over grad_accum_steps mini-batches
-    # before stepping the optimiser, simulating a larger effective batch.
     optimizer.zero_grad(set_to_none=True)
-    for micro in range(tcfg.grad_accum_steps):
-        x, y = get_batch("train")
+    for _ in range(tcfg.grad_accum_steps):
+        x, y = next_batch()
         with torch.amp.autocast(device_type=DEVICE, dtype=AMP_DTYPE, enabled=USE_AMP):
             _, loss, _ = model(x, y)
             loss = loss / tcfg.grad_accum_steps
@@ -137,10 +152,12 @@ for step in range(tcfg.max_iters):
 # ---------------------------------------------------------------------------
 torch.save(
     {
-        "model":          model.state_dict(),
-        "model_config":   mcfg.to_dict(),
+        "model":           model.state_dict(),
+        "optimizer":       optimizer.state_dict(),
+        "step":            tcfg.max_iters - 1,
+        "model_config":    mcfg.to_dict(),
         "tokenizer_vocab": tokenizer.vocab,
-        "train_config":   tcfg.__dict__,
+        "train_config":    tcfg.__dict__,
     },
     tcfg.out_path,
 )
