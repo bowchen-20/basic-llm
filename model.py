@@ -12,67 +12,87 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 # ---------------------------------------------------------------------------
 
 def precompute_rope_freqs(head_dim: int, seq_len: int, theta: float = 10000.0) -> torch.Tensor:
-    """
-    Precompute complex rotary frequencies for all positions up to seq_len.
-    Returns a complex64 tensor of shape (seq_len, head_dim // 2).
-    """
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     t     = torch.arange(seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)                       # (seq_len, head_dim/2)
-    return torch.polar(torch.ones_like(freqs), freqs)   # complex64
+    freqs = torch.outer(t, freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)   # complex64 (seq_len, head_dim/2)
 
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Rotate x using precomputed complex frequencies.
-
-    x:         (B, n_head, T, head_dim)
-    freqs_cis: (T, head_dim // 2)  complex
-    """
+    """x: (B, n_head, T, head_dim)  |  freqs_cis: (T, head_dim/2) complex."""
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     fc = freqs_cis.view(1, 1, freqs_cis.shape[0], freqs_cis.shape[1])
     return torch.view_as_real(xc * fc).flatten(3).type_as(x)
 
 
 # ---------------------------------------------------------------------------
-# BigramLM (reference baseline)
+# Normalisation layers
 # ---------------------------------------------------------------------------
 
-class BigramLM(nn.Module):
-    """Kept for reference — predicts the next token from the current token only."""
-
-    def __init__(self, vocab_size: int):
+class RMSNorm(nn.Module):
+    """
+    Root-mean-square layer norm (no mean subtraction, just scale by RMS).
+    Simpler and slightly faster than LayerNorm; used in LLaMA/Mistral.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, vocab_size)
+        self.eps    = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x, targets=None):
-        logits = self.embedding(x)
-        if targets is None:
-            return logits, None
-        B, T, C = logits.shape
-        loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
-        return logits, loss
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight
 
-    @torch.no_grad()
-    def generate(self, x, max_new_tokens, **_):
-        for _ in range(max_new_tokens):
-            logits, _ = self(x)
-            x = torch.cat([x, torch.multinomial(F.softmax(logits[:, -1, :], dim=-1), 1)], dim=1)
-        return x
+
+def make_norm(dim: int, cfg: ModelConfig) -> nn.Module:
+    return RMSNorm(dim) if cfg.use_rmsnorm else nn.LayerNorm(dim)
 
 
 # ---------------------------------------------------------------------------
-# Transformer building blocks
+# MLP variants
+# ---------------------------------------------------------------------------
+
+class GeLUMLP(nn.Module):
+    """Standard GPT-2 MLP: Linear → GELU → Linear, 4× width."""
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.fc   = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
+        self.proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.proj(F.gelu(self.fc(x))))
+
+
+class SwiGLUMLP(nn.Module):
+    """
+    SwiGLU feed-forward (LLaMA style): gate * up → down.
+
+    Uses 8/3 × n_embd hidden width (rounded to nearest 64) so the total
+    parameter count stays comparable to a 4× GELU MLP.
+    """
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        hidden = int(cfg.n_embd * 8 / 3)
+        hidden = (hidden + 63) // 64 * 64   # round up to multiple of 64
+        self.gate = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.up   = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
+
+
+def make_mlp(cfg: ModelConfig) -> nn.Module:
+    return SwiGLUMLP(cfg) if cfg.use_swiglu else GeLUMLP(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Causal self-attention with KV-cache + optional RoPE + Flash Attention
 # ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
-    """
-    Multi-head causal self-attention.
-
-    Uses F.scaled_dot_product_attention (Flash Attention when available) and
-    optional RoPE applied to Q/K before the cache is updated.
-    """
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
@@ -100,8 +120,6 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
-        # RoPE is applied before the KV-cache so stored keys carry their
-        # position baked in — no positional correction needed at decode time.
         if self.use_rope and freqs_cis is not None:
             q = apply_rope(q, freqs_cis)
             k = apply_rope(k, freqs_cis)
@@ -116,44 +134,30 @@ class CausalSelfAttention(nn.Module):
         dp = self.dropout_p if self.training else 0.0
 
         if T == 1:
-            # Decode step: new token attends to all cached positions — no mask.
             y = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=False)
         elif T_past == 0:
-            # Training / fresh prefill: standard causal mask via SDPA flag.
             y = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=True)
         else:
-            # Prefill with an existing cache: build an explicit boolean mask.
             rows = torch.arange(T,    device=x.device).unsqueeze(1)
             cols = torch.arange(T_kv, device=x.device).unsqueeze(0)
-            mask = (cols <= rows + T_past)                       # (T, T_kv)
+            mask = (cols <= rows + T_past)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dp)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.c_proj(y)), present_kv
 
 
-class MLP(nn.Module):
-    """Position-wise feed-forward: Linear → GELU → Linear, 4× width."""
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.fc   = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
-        self.proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
-        self.drop = nn.Dropout(cfg.dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.proj(F.gelu(self.fc(x))))
-
+# ---------------------------------------------------------------------------
+# Transformer block
+# ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    """Pre-norm residual: LN → Attn → +x,  LN → MLP → +x."""
-
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.ln1  = nn.LayerNorm(cfg.n_embd)
+        self.ln1  = make_norm(cfg.n_embd, cfg)
         self.attn = CausalSelfAttention(cfg)
-        self.ln2  = nn.LayerNorm(cfg.n_embd)
-        self.mlp  = MLP(cfg)
+        self.ln2  = make_norm(cfg.n_embd, cfg)
+        self.mlp  = make_mlp(cfg)
 
     def forward(
         self,
@@ -175,14 +179,7 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TransformerLM(nn.Module):
-    """
-    GPT-style causal language model.
-
-    Positional encoding:
-      use_rope=True  — rotary embeddings (default); no position parameters,
-                       better length extrapolation, used in LLaMA/Mistral.
-      use_rope=False — learned absolute position embeddings (original GPT-2).
-    """
+    """GPT-style causal language model. Architecture controlled by ModelConfig."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -198,7 +195,7 @@ class TransformerLM(nn.Module):
             self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
 
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f   = nn.LayerNorm(cfg.n_embd)
+        self.ln_f   = make_norm(cfg.n_embd, cfg)
         self.head   = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight   # weight tying
 
@@ -211,12 +208,34 @@ class TransformerLM(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, RMSNorm)):
             nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+            if hasattr(module, "bias") and module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+    def configure_optimizer(
+        self,
+        lr: float,
+        weight_decay: float,
+        betas: tuple[float, float] = (0.9, 0.95),
+    ) -> torch.optim.AdamW:
+        """
+        Split parameters into two groups: tensors with ndim >= 2 get weight
+        decay; 1-D params (biases, norm scales) do not.  This follows the
+        standard practice from GPT-2 / nanoGPT.
+        """
+        decay_params  = [p for p in self.parameters() if p.dim() >= 2]
+        nodecay_params = [p for p in self.parameters() if p.dim() < 2]
+        return torch.optim.AdamW(
+            [
+                {"params": decay_params,   "weight_decay": weight_decay},
+                {"params": nodecay_params, "weight_decay": 0.0},
+            ],
+            lr=lr, betas=betas,
+        )
 
     def forward(
         self,
@@ -262,12 +281,6 @@ class TransformerLM(nn.Module):
         top_k: int | None = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        """
-        Sample max_new_tokens tokens auto-regressively.
-
-        use_cache=True  — prefill once then O(1) decode per step via KV-cache.
-        use_cache=False — re-runs full context each step; simpler but O(n²).
-        """
         def sample(logits: torch.Tensor) -> torch.Tensor:
             logits = logits / temperature
             if top_k is not None:
@@ -290,4 +303,29 @@ class TransformerLM(nn.Module):
                 next_tok = sample(logits[:, -1, :])
                 x = torch.cat([x, next_tok], dim=1)
 
+        return x
+
+
+# ---------------------------------------------------------------------------
+# BigramLM — kept as a reference baseline
+# ---------------------------------------------------------------------------
+
+class BigramLM(nn.Module):
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, vocab_size)
+
+    def forward(self, x, targets=None):
+        logits = self.embedding(x)
+        if targets is None:
+            return logits, None
+        B, T, C = logits.shape
+        loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, x, max_new_tokens, **_):
+        for _ in range(max_new_tokens):
+            logits, _ = self(x)
+            x = torch.cat([x, torch.multinomial(F.softmax(logits[:, -1, :], dim=-1), 1)], dim=1)
         return x

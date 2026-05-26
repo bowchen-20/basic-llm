@@ -3,13 +3,15 @@ from dataclasses import dataclass, asdict
 
 @dataclass
 class ModelConfig:
-    vocab_size: int   = 256
-    n_embd:     int   = 128
-    n_head:     int   = 4
-    n_layer:    int   = 4
-    block_size: int   = 128
-    dropout:    float = 0.0
-    use_rope:   bool  = True   # rotary positional embeddings (vs learned)
+    vocab_size:  int   = 256
+    n_embd:      int   = 128
+    n_head:      int   = 4
+    n_layer:     int   = 4
+    block_size:  int   = 128
+    dropout:     float = 0.0
+    use_rope:    bool  = True   # rotary positional embeddings (vs learned)
+    use_rmsnorm: bool  = True   # RMSNorm (vs LayerNorm)
+    use_swiglu:  bool  = True   # SwiGLU MLP (vs GELU)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -18,8 +20,10 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     # data
-    data_path: str = "data/input.txt"
-    out_path:  str = "checkpoint.pt"
+    data_path:      str = "data/input.txt"
+    out_path:       str = "checkpoint.pt"
+    tokenizer_type: str = "char"   # "char" or "bpe"
+    bpe_vocab_size: int = 500      # only used when tokenizer_type == "bpe"
 
     # batching
     batch_size:       int = 32

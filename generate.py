@@ -2,32 +2,23 @@
 Standalone inference script.
 
 Usage:
-    python generate.py                                  # empty prompt
-    python generate.py --prompt "hello"
-    python generate.py --prompt "hello" --max_tokens 300 --temperature 0.9 --top_k 50
-    python generate.py --checkpoint checkpoint.pt --no_cache
+    python generate.py
+    python generate.py --prompt "hello world"
+    python generate.py --checkpoint checkpoint.pt --max_tokens 300 --temperature 0.9 --top_k 50
+    python generate.py --no_cache
 """
 
 import argparse
 import torch
-from tokenizer import CharTokenizer
+from tokenizer import tokenizer_from_state
 from model import TransformerLM
 from config import ModelConfig
 
 
-def load_checkpoint(path: str, device: str) -> tuple[TransformerLM, CharTokenizer]:
+def load_checkpoint(path: str, device: str):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    # Reconstruct tokenizer from saved vocab list.
-    vocab = ckpt["tokenizer_vocab"]
-    tok = CharTokenizer.__new__(CharTokenizer)
-    tok.vocab      = vocab
-    tok.vocab_size = len(vocab)
-    tok._stoi      = {c: i for i, c in enumerate(vocab)}
-    tok._itos      = {i: c for i, c in enumerate(vocab)}
-
-    # Reconstruct model from saved config.
-    cfg = ModelConfig(**ckpt["model_config"])
+    tok   = tokenizer_from_state(ckpt["tokenizer_state"])
+    cfg   = ModelConfig(**ckpt["model_config"])
     model = TransformerLM(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -36,24 +27,20 @@ def load_checkpoint(path: str, device: str) -> tuple[TransformerLM, CharTokenize
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate text from a checkpoint.")
-    parser.add_argument("--checkpoint",   default="checkpoint.pt",  help="Path to .pt checkpoint")
-    parser.add_argument("--prompt",       default="",               help="Prompt string (empty = null token)")
-    parser.add_argument("--max_tokens",   type=int,   default=200,  help="Number of tokens to generate")
-    parser.add_argument("--temperature",  type=float, default=0.8,  help="Sampling temperature")
-    parser.add_argument("--top_k",        type=int,   default=40,   help="Top-k sampling (0 = disabled)")
-    parser.add_argument("--no_cache",     action="store_true",      help="Disable KV-cache (slower but simpler)")
+    parser.add_argument("--checkpoint",  default="checkpoint.pt")
+    parser.add_argument("--prompt",      default="")
+    parser.add_argument("--max_tokens",  type=int,   default=200)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top_k",       type=int,   default=40,  help="0 = disabled")
+    parser.add_argument("--no_cache",    action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tok = load_checkpoint(args.checkpoint, device)
     print(f"Loaded {model.num_params():,}-param model on {device}")
 
-    if args.prompt:
-        ids = tok.encode(args.prompt)
-    else:
-        ids = [0]
-
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    ids = tok.encode(args.prompt) if args.prompt else [0]
+    x   = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
 
     with torch.no_grad():
         out = model.generate(

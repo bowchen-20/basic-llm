@@ -1,7 +1,7 @@
 import math
 import os
 import torch
-from tokenizer import CharTokenizer
+from tokenizer import CharTokenizer, BPETokenizer
 from model import TransformerLM
 from config import ModelConfig, TrainConfig
 from data import build_datasets, make_loader
@@ -10,17 +10,21 @@ from data import build_datasets, make_loader
 # Config
 # ---------------------------------------------------------------------------
 mcfg = ModelConfig(
-    n_embd     = 128,
-    n_head     = 4,
-    n_layer    = 4,
-    block_size = 128,
-    dropout    = 0.0,
-    use_rope   = True,
+    n_embd      = 128,
+    n_head      = 4,
+    n_layer     = 4,
+    block_size  = 128,
+    dropout     = 0.0,
+    use_rope    = True,
+    use_rmsnorm = True,
+    use_swiglu  = True,
 )
 
 tcfg = TrainConfig(
     data_path        = "data/input.txt",
     out_path         = "checkpoint.pt",
+    tokenizer_type   = "char",   # switch to "bpe" for subword tokenization
+    bpe_vocab_size   = 500,
     batch_size       = 32,
     block_size       = 128,
     grad_accum_steps = 1,
@@ -48,8 +52,15 @@ try:
 except FileNotFoundError:
     text = "hello world " * 2000
 
-tokenizer = CharTokenizer(text)
+if tcfg.tokenizer_type == "bpe":
+    print(f"Training BPETokenizer to vocab_size={tcfg.bpe_vocab_size} ...")
+    tokenizer = BPETokenizer()
+    tokenizer.train(text, tcfg.bpe_vocab_size)
+else:
+    tokenizer = CharTokenizer(text)
+
 mcfg.vocab_size = tokenizer.vocab_size
+print(f"Tokenizer: {tcfg.tokenizer_type}  vocab_size={mcfg.vocab_size}")
 
 train_ds, val_ds = build_datasets(text, tokenizer, tcfg.block_size)
 train_loader = make_loader(train_ds, tcfg.batch_size, shuffle=True)
@@ -85,10 +96,8 @@ def get_lr(step: int) -> float:
 # Model + optimiser
 # ---------------------------------------------------------------------------
 model = TransformerLM(mcfg).to(DEVICE)
-optimizer = torch.optim.AdamW(
-    model.parameters(),
+optimizer = model.configure_optimizer(
     lr           = tcfg.lr_max,
-    betas        = (0.9, 0.95),
     weight_decay = tcfg.weight_decay,
 )
 scaler = torch.amp.GradScaler(enabled=USE_AMP)
@@ -152,12 +161,12 @@ for step in range(start_step, tcfg.max_iters):
 # ---------------------------------------------------------------------------
 torch.save(
     {
-        "model":           model.state_dict(),
-        "optimizer":       optimizer.state_dict(),
-        "step":            tcfg.max_iters - 1,
-        "model_config":    mcfg.to_dict(),
-        "tokenizer_vocab": tokenizer.vocab,
-        "train_config":    tcfg.__dict__,
+        "model":            model.state_dict(),
+        "optimizer":        optimizer.state_dict(),
+        "step":             tcfg.max_iters - 1,
+        "model_config":     mcfg.to_dict(),
+        "tokenizer_state":  tokenizer.get_state(),
+        "train_config":     tcfg.__dict__,
     },
     tcfg.out_path,
 )

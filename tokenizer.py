@@ -28,6 +28,9 @@ class CharTokenizer:
     def decode(self, tokens):
         return "".join(self._itos[t] for t in tokens)
 
+    def get_state(self) -> dict:
+        return {"type": "char", "vocab": self.vocab}
+
 
 class BPETokenizer:
     """
@@ -394,6 +397,14 @@ class BPETokenizer:
             ids = self._merge(ids, best, self.merges[best])
         return ids
 
+    def get_state(self) -> dict:
+        return {
+            "type":    "bpe",
+            "merges":  {f"{a},{b}": c for (a, b), c in self.merges.items()},
+            "vocab":   {str(k): list(v) for k, v in self.vocab.items()},
+            "special": {s: sid for s, sid in self._special.items()},
+        }
+
     @staticmethod
     def _merge(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
         result: list[int] = []
@@ -406,3 +417,34 @@ class BPETokenizer:
                 result.append(ids[i])
                 i += 1
         return result
+
+
+# ---------------------------------------------------------------------------
+# Serialisation helpers
+# ---------------------------------------------------------------------------
+
+def tokenizer_from_state(state: dict):
+    """Reconstruct a CharTokenizer or BPETokenizer from a saved state dict."""
+    if state["type"] == "char":
+        vocab = state["vocab"]
+        tok = CharTokenizer.__new__(CharTokenizer)
+        tok.vocab      = vocab
+        tok.vocab_size = len(vocab)
+        tok._stoi      = {c: i for i, c in enumerate(vocab)}
+        tok._itos      = {i: c for i, c in enumerate(vocab)}
+        return tok
+
+    if state["type"] == "bpe":
+        tok = BPETokenizer()
+        tok.merges = {
+            tuple(int(x) for x in k.split(",")): v
+            for k, v in state["merges"].items()
+        }
+        tok.vocab   = {int(k): bytes(v) for k, v in state["vocab"].items()}
+        tok._special = {s: sid for s, sid in state.get("special", {}).items()}
+        tok._special_tokens = list(tok._special.keys())
+        tok.vocab_size = len(tok.vocab)
+        tok._bytes_to_id = {v: k for k, v in tok.vocab.items()}
+        return tok
+
+    raise ValueError(f"Unknown tokenizer type: {state['type']!r}")
