@@ -279,6 +279,7 @@ class TransformerLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float | None = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         def sample(logits: torch.Tensor) -> torch.Tensor:
@@ -286,6 +287,13 @@ class TransformerLM(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                # remove tokens where cumulative prob exceeds top_p (shift right to keep the crossing token)
+                remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+                sorted_logits[remove] = float("-inf")
+                logits = logits.scatter(-1, sorted_indices, sorted_logits)
             return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
 
         if use_cache:

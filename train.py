@@ -131,6 +131,8 @@ def next_batch() -> tuple[torch.Tensor, torch.Tensor]:
     return x.to(DEVICE), y.to(DEVICE)
 
 
+last_grad_norm = 0.0
+
 for step in range(start_step, tcfg.max_iters):
     lr = get_lr(step)
     for pg in optimizer.param_groups:
@@ -140,7 +142,8 @@ for step in range(start_step, tcfg.max_iters):
         losses = estimate_loss(model)
         print(
             f"step {step:5d}  lr={lr:.2e}  "
-            f"train={losses['train']:.4f}  val={losses['val']:.4f}"
+            f"train={losses['train']:.4f}  val={losses['val']:.4f}  "
+            f"grad_norm={last_grad_norm:.3f}"
         )
 
     optimizer.zero_grad(set_to_none=True)
@@ -152,7 +155,7 @@ for step in range(start_step, tcfg.max_iters):
         scaler.scale(loss).backward()
 
     scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+    last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip).item()
     scaler.step(optimizer)
     scaler.update()
 

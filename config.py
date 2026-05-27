@@ -46,3 +46,22 @@ class TrainConfig:
 
     # precision: "float32" or "bfloat16"
     dtype: str = "float32"
+
+
+# ---------------------------------------------------------------------------
+# Architecture presets
+# ---------------------------------------------------------------------------
+
+def small_config(**kwargs) -> ModelConfig:
+    """~1M params at vocab_size=100: good for character-level experiments."""
+    return ModelConfig(n_embd=128, n_head=4, n_layer=4, block_size=128, **kwargs)
+
+
+def medium_config(**kwargs) -> ModelConfig:
+    """~8M params at vocab_size=500: reasonable for BPE on small corpora."""
+    return ModelConfig(n_embd=256, n_head=8, n_layer=6, block_size=256, **kwargs)
+
+
+def large_config(**kwargs) -> ModelConfig:
+    """~50M params at vocab_size=4096: suitable for larger text datasets."""
+    return ModelConfig(n_embd=512, n_head=8, n_layer=8, block_size=512, **kwargs)
