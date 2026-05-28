@@ -5,6 +5,8 @@ Works with any tokenizer that exposes encode(text) -> list[int],
 so both CharTokenizer and BPETokenizer plug in without changes.
 """
 
+import glob as _glob
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -64,3 +66,29 @@ def make_loader(
         pin_memory  = True,
         drop_last   = True,   # keeps batch size constant throughout training
     )
+
+
+def build_datasets_from_dir(
+    dir_path: str,
+    tokenizer,
+    block_size: int,
+    val_frac: float = 0.1,
+    pattern: str = "*.txt",
+) -> tuple[TokenDataset, TokenDataset]:
+    """
+    Load all files matching pattern from dir_path, concatenate them,
+    and return train / val datasets.
+
+    Files are sorted by name so the split is deterministic.
+    Each file is separated by a newline to prevent context bleed across
+    document boundaries.
+    """
+    paths = sorted(_glob.glob(os.path.join(dir_path, pattern)))
+    if not paths:
+        raise FileNotFoundError(f"No files matching '{pattern}' in {dir_path!r}")
+    parts: list[str] = []
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            parts.append(f.read())
+    print(f"Loaded {len(parts)} file(s) from {dir_path!r} ({sum(len(t) for t in parts):,} chars)")
+    return build_datasets("\n".join(parts), tokenizer, block_size, val_frac)

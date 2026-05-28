@@ -37,6 +37,7 @@ def run_generation(model, tok, prompt, args, device):
             temperature    = args.temperature,
             top_k          = args.top_k if args.top_k > 0 else None,
             top_p          = args.top_p if args.top_p > 0.0 else None,
+            rep_penalty    = args.rep_penalty,
             use_cache      = not args.no_cache,
         )
     return tok.decode(out[0].tolist())
@@ -50,10 +51,16 @@ def main() -> None:
     parser.add_argument("--temperature",  type=float, default=0.8)
     parser.add_argument("--top_k",        type=int,   default=40,  help="0 = disabled")
     parser.add_argument("--top_p",        type=float, default=0.0, help="nucleus sampling, 0 = disabled")
+    parser.add_argument("--rep_penalty",  type=float, default=1.0,
+                        help="repetition penalty; >1.0 discourages repeated tokens")
+    parser.add_argument("--seed",         type=int,   default=-1,  help="random seed (-1 = no seed)")
     parser.add_argument("--no_cache",     action="store_true")
     parser.add_argument("--interactive",  action="store_true",
                         help="Start an interactive prompt loop (REPL)")
     args = parser.parse_args()
+
+    if args.seed >= 0:
+        torch.manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tok = load_checkpoint(args.checkpoint, device)

@@ -280,9 +280,16 @@ class TransformerLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         top_p: float | None = None,
+        rep_penalty: float = 1.0,
         use_cache: bool = True,
     ) -> torch.Tensor:
         def sample(logits: torch.Tensor) -> torch.Tensor:
+            if rep_penalty != 1.0:
+                for token_id in set(x[0].tolist()):
+                    if logits[0, token_id] > 0:
+                        logits[0, token_id] /= rep_penalty
+                    else:
+                        logits[0, token_id] *= rep_penalty
             logits = logits / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import torch
@@ -132,6 +133,12 @@ def next_batch() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 last_grad_norm = 0.0
+best_val_loss  = float("inf")
+best_path      = tcfg.out_path.replace(".pt", "_best.pt")
+log_path       = tcfg.out_path.replace(".pt", "_log.csv")
+
+with open(log_path, "w", newline="", encoding="utf-8") as _f:
+    csv.writer(_f).writerow(["step", "lr", "train_loss", "val_loss", "grad_norm"])
 
 for step in range(start_step, tcfg.max_iters):
     lr = get_lr(step)
@@ -145,6 +152,26 @@ for step in range(start_step, tcfg.max_iters):
             f"train={losses['train']:.4f}  val={losses['val']:.4f}  "
             f"grad_norm={last_grad_norm:.3f}"
         )
+        with open(log_path, "a", newline="", encoding="utf-8") as _f:
+            csv.writer(_f).writerow([
+                step, f"{lr:.6f}",
+                f"{losses['train']:.4f}", f"{losses['val']:.4f}",
+                f"{last_grad_norm:.4f}",
+            ])
+        if losses["val"] < best_val_loss:
+            best_val_loss = losses["val"]
+            torch.save(
+                {
+                    "model":           model.state_dict(),
+                    "optimizer":       optimizer.state_dict(),
+                    "step":            step,
+                    "model_config":    mcfg.to_dict(),
+                    "tokenizer_state": tokenizer.get_state(),
+                    "train_config":    tcfg.__dict__,
+                },
+                best_path,
+            )
+            print(f"  -> best val {best_val_loss:.4f}  saved {best_path}")
 
     optimizer.zero_grad(set_to_none=True)
     for _ in range(tcfg.grad_accum_steps):
