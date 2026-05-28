@@ -47,6 +47,12 @@ class TrainConfig:
     # precision: "float32" or "bfloat16"
     dtype: str = "float32"
 
+    # reproducibility
+    seed: int = -1   # -1 = no fixed seed
+
+    # torch.compile (PyTorch 2+ only)
+    compile: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Architecture presets

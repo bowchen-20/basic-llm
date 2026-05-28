@@ -1,6 +1,7 @@
 import csv
 import math
 import os
+import time
 import torch
 from tokenizer import CharTokenizer, BPETokenizer
 from model import TransformerLM
@@ -43,6 +44,10 @@ tcfg = TrainConfig(
 DEVICE    = "cuda" if torch.cuda.is_available() else "cpu"
 AMP_DTYPE = torch.bfloat16 if tcfg.dtype == "bfloat16" else torch.float32
 USE_AMP   = (tcfg.dtype == "bfloat16") and (DEVICE == "cuda")
+
+if tcfg.seed >= 0:
+    torch.manual_seed(tcfg.seed)
+    print(f"Seed: {tcfg.seed}")
 
 # ---------------------------------------------------------------------------
 # Data
@@ -117,6 +122,10 @@ if os.path.exists(tcfg.out_path):
 else:
     print(f"Parameters: {model.num_params():,}  |  device: {DEVICE}  |  dtype: {tcfg.dtype}")
 
+if tcfg.compile and hasattr(torch, "compile"):
+    model = torch.compile(model)
+    print("torch.compile() enabled")
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -136,6 +145,7 @@ last_grad_norm = 0.0
 best_val_loss  = float("inf")
 best_path      = tcfg.out_path.replace(".pt", "_best.pt")
 log_path       = tcfg.out_path.replace(".pt", "_log.csv")
+t0             = time.time()
 
 with open(log_path, "w", newline="", encoding="utf-8") as _f:
     csv.writer(_f).writerow(["step", "lr", "train_loss", "val_loss", "grad_norm"])
@@ -147,10 +157,14 @@ for step in range(start_step, tcfg.max_iters):
 
     if step % tcfg.eval_interval == 0:
         losses = estimate_loss(model)
+        elapsed = time.time() - t0
+        steps_done = max(1, step - start_step)
+        eta_mins = (tcfg.max_iters - step) * (elapsed / steps_done) / 60
+        eta_str = f"  eta={eta_mins:.0f}min" if step > start_step else ""
         print(
             f"step {step:5d}  lr={lr:.2e}  "
             f"train={losses['train']:.4f}  val={losses['val']:.4f}  "
-            f"grad_norm={last_grad_norm:.3f}"
+            f"grad_norm={last_grad_norm:.3f}{eta_str}"
         )
         with open(log_path, "a", newline="", encoding="utf-8") as _f:
             csv.writer(_f).writerow([

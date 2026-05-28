@@ -27,20 +27,32 @@ def load_checkpoint(path: str, device: str):
     return model.to(device), tok
 
 
+def _gen_kwargs(args):
+    return dict(
+        max_new_tokens = args.max_tokens,
+        temperature    = args.temperature,
+        top_k          = args.top_k if args.top_k > 0 else None,
+        top_p          = args.top_p if args.top_p > 0.0 else None,
+        rep_penalty    = args.rep_penalty,
+        use_cache      = not args.no_cache,
+    )
+
+
 def run_generation(model, tok, prompt, args, device):
     ids = tok.encode(prompt) if prompt else [0]
     x   = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     with torch.no_grad():
-        out = model.generate(
-            x,
-            max_new_tokens = args.max_tokens,
-            temperature    = args.temperature,
-            top_k          = args.top_k if args.top_k > 0 else None,
-            top_p          = args.top_p if args.top_p > 0.0 else None,
-            rep_penalty    = args.rep_penalty,
-            use_cache      = not args.no_cache,
-        )
+        out = model.generate(x, **_gen_kwargs(args))
     return tok.decode(out[0].tolist())
+
+
+def run_generation_stream(model, tok, prompt, args, device):
+    ids = tok.encode(prompt) if prompt else [0]
+    x   = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    with torch.no_grad():
+        for tok_tensor in model.generate_stream(x, **_gen_kwargs(args)):
+            print(tok.decode(tok_tensor[0].tolist()), end="", flush=True)
+    print()
 
 
 def main() -> None:
@@ -54,6 +66,8 @@ def main() -> None:
     parser.add_argument("--rep_penalty",  type=float, default=1.0,
                         help="repetition penalty; >1.0 discourages repeated tokens")
     parser.add_argument("--seed",         type=int,   default=-1,  help="random seed (-1 = no seed)")
+    parser.add_argument("--stream",       action="store_true",
+                        help="Print tokens as they are generated instead of all at once")
     parser.add_argument("--no_cache",     action="store_true")
     parser.add_argument("--interactive",  action="store_true",
                         help="Start an interactive prompt loop (REPL)")
@@ -66,6 +80,12 @@ def main() -> None:
     model, tok = load_checkpoint(args.checkpoint, device)
     print(f"Loaded {model.num_params():,}-param model on {device}")
 
+    def emit(prompt: str) -> None:
+        if args.stream:
+            run_generation_stream(model, tok, prompt, args, device)
+        else:
+            print(run_generation(model, tok, prompt, args, device))
+
     if args.interactive:
         print("Interactive mode. Type a prompt and press Enter. Empty line to quit.\n")
         while True:
@@ -76,10 +96,10 @@ def main() -> None:
                 break
             if not prompt:
                 break
-            print(run_generation(model, tok, prompt, args, device))
+            emit(prompt)
             print()
     else:
-        print(run_generation(model, tok, args.prompt, args, device))
+        emit(args.prompt)
 
 
 if __name__ == "__main__":

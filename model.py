@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,6 +59,7 @@ class GeLUMLP(nn.Module):
         super().__init__()
         self.fc   = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
         self.proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
+        self.proj._is_residual = True
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -78,6 +80,7 @@ class SwiGLUMLP(nn.Module):
         self.gate = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.up   = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
+        self.down._is_residual = True
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -103,6 +106,7 @@ class CausalSelfAttention(nn.Module):
 
         self.c_attn    = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
         self.c_proj    = nn.Linear(cfg.n_embd, cfg.n_embd,     bias=False)
+        self.c_proj._is_residual = True
         self.resid_drop = nn.Dropout(cfg.dropout)
 
     def forward(
@@ -203,7 +207,12 @@ class TransformerLM(nn.Module):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, std=0.02)
+            # GPT-2 style: scale residual projections by 1/sqrt(2 * n_layer) so
+            # the residual stream variance stays ~1 regardless of depth.
+            std = 0.02
+            if getattr(module, "_is_residual", False):
+                std /= math.sqrt(2 * self.cfg.n_layer)
+            nn.init.normal_(module.weight, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -272,6 +281,34 @@ class TransformerLM(nn.Module):
 
         return logits, loss, (present_kvs if use_cache else None)
 
+    def _sample_token(
+        self,
+        logits: torch.Tensor,
+        context: torch.Tensor,
+        temperature: float,
+        top_k: int | None,
+        top_p: float | None,
+        rep_penalty: float,
+    ) -> torch.Tensor:
+        logits = logits.clone()
+        if rep_penalty != 1.0:
+            for token_id in set(context[0].tolist()):
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= rep_penalty
+                else:
+                    logits[0, token_id] *= rep_penalty
+        logits = logits / temperature
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float("-inf")
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+            sorted_logits[remove] = float("-inf")
+            logits = logits.scatter(-1, sorted_indices, sorted_logits)
+        return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+
     @torch.no_grad()
     def generate(
         self,
@@ -283,42 +320,51 @@ class TransformerLM(nn.Module):
         rep_penalty: float = 1.0,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        def sample(logits: torch.Tensor) -> torch.Tensor:
-            if rep_penalty != 1.0:
-                for token_id in set(x[0].tolist()):
-                    if logits[0, token_id] > 0:
-                        logits[0, token_id] /= rep_penalty
-                    else:
-                        logits[0, token_id] *= rep_penalty
-            logits = logits / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                # remove tokens where cumulative prob exceeds top_p (shift right to keep the crossing token)
-                remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
-                sorted_logits[remove] = float("-inf")
-                logits = logits.scatter(-1, sorted_indices, sorted_logits)
-            return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-
         if use_cache:
             logits, _, past_kvs = self(x, use_cache=True)
-            next_tok = sample(logits[:, -1, :])
+            next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
             x = torch.cat([x, next_tok], dim=1)
             for _ in range(max_new_tokens - 1):
                 logits, _, past_kvs = self(next_tok, past_key_values=past_kvs, use_cache=True)
-                next_tok = sample(logits[:, -1, :])
+                next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
                 x = torch.cat([x, next_tok], dim=1)
         else:
             for _ in range(max_new_tokens):
                 x_cond = x[:, -self.cfg.block_size:]
                 logits, _, _ = self(x_cond)
-                next_tok = sample(logits[:, -1, :])
+                next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
                 x = torch.cat([x, next_tok], dim=1)
-
         return x
+
+    @torch.no_grad()
+    def generate_stream(
+        self,
+        x: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        rep_penalty: float = 1.0,
+        use_cache: bool = True,
+    ):
+        """Yield one token tensor at a time for character-by-character streaming."""
+        if use_cache:
+            logits, _, past_kvs = self(x, use_cache=True)
+            next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
+            x = torch.cat([x, next_tok], dim=1)
+            yield next_tok
+            for _ in range(max_new_tokens - 1):
+                logits, _, past_kvs = self(next_tok, past_key_values=past_kvs, use_cache=True)
+                next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
+                x = torch.cat([x, next_tok], dim=1)
+                yield next_tok
+        else:
+            for _ in range(max_new_tokens):
+                x_cond = x[:, -self.cfg.block_size:]
+                logits, _, _ = self(x_cond)
+                next_tok = self._sample_token(logits[:, -1, :], x, temperature, top_k, top_p, rep_penalty)
+                x = torch.cat([x, next_tok], dim=1)
+                yield next_tok
 
 
 # ---------------------------------------------------------------------------
