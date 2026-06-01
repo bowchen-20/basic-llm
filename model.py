@@ -99,13 +99,19 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
-        self.n_head   = cfg.n_head
-        self.head_dim = cfg.n_embd // cfg.n_head
+        self.n_head    = cfg.n_head
+        self.n_kv_head = cfg.n_kv_head or cfg.n_head   # 0 → standard MHA
+        self.n_groups  = self.n_head // self.n_kv_head
+        self.head_dim  = cfg.n_embd // cfg.n_head
+        assert self.n_head % self.n_kv_head == 0, "n_head must be divisible by n_kv_head"
         self.dropout_p = cfg.dropout
         self.use_rope  = cfg.use_rope
 
-        self.c_attn    = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
-        self.c_proj    = nn.Linear(cfg.n_embd, cfg.n_embd,     bias=False)
+        # Separate Q and KV projections so KV width can be smaller than Q (GQA).
+        # When n_kv_head == n_head this is equivalent to a single fused projection.
+        self.c_attn_q  = nn.Linear(cfg.n_embd, self.n_head    * self.head_dim, bias=False)
+        self.c_attn_kv = nn.Linear(cfg.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj    = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         self.c_proj._is_residual = True
         self.resid_drop = nn.Dropout(cfg.dropout)
 
@@ -117,12 +123,11 @@ class CausalSelfAttention(nn.Module):
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, KVCache | None]:
         B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(C, dim=2)
-
-        def split_heads(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-
-        q, k, v = split_heads(q), split_heads(k), split_heads(v)
+        q  = self.c_attn_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        kv = self.c_attn_kv(x)
+        k, v = kv.split(self.n_kv_head * self.head_dim, dim=2)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
         if self.use_rope and freqs_cis is not None:
             q = apply_rope(q, freqs_cis)
@@ -135,8 +140,14 @@ class CausalSelfAttention(nn.Module):
         present_kv: KVCache | None = (k, v) if use_cache else None
         T_kv  = k.size(2)
         T_past = T_kv - T
-        dp = self.dropout_p if self.training else 0.0
 
+        # Expand KV heads to match Q heads for grouped-query attention.
+        # When n_groups == 1 this is a no-op (standard MHA).
+        if self.n_groups > 1:
+            k = k.repeat_interleave(self.n_groups, dim=1)
+            v = v.repeat_interleave(self.n_groups, dim=1)
+
+        dp = self.dropout_p if self.training else 0.0
         if T == 1:
             y = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=False)
         elif T_past == 0:
@@ -267,9 +278,17 @@ class TransformerLM(nn.Module):
         h = self.drop(h)
 
         present_kvs: list[KVCache | None] = []
+        use_gc = self.cfg.use_grad_checkpoint and self.training and not use_cache
         for i, block in enumerate(self.blocks):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            h, present_kv = block(h, freqs_cis=freqs_cis, past_kv=past_kv, use_cache=use_cache)
+            if use_gc:
+                # Gradient checkpointing: recompute activations in backward instead
+                # of storing them, trading compute for peak memory.
+                h, present_kv = torch.utils.checkpoint.checkpoint(
+                    block, h, freqs_cis, past_kv, use_cache, use_reentrant=False
+                )
+            else:
+                h, present_kv = block(h, freqs_cis=freqs_cis, past_kv=past_kv, use_cache=use_cache)
             present_kvs.append(present_kv)
 
         logits = self.head(self.ln_f(h))

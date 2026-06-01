@@ -12,6 +12,8 @@ class ModelConfig:
     use_rope:    bool  = True   # rotary positional embeddings (vs learned)
     use_rmsnorm: bool  = True   # RMSNorm (vs LayerNorm)
     use_swiglu:  bool  = True   # SwiGLU MLP (vs GELU)
+    n_kv_head:   int   = 0      # 0 = n_head (standard MHA); set smaller for GQA
+    use_grad_checkpoint: bool = False  # recompute activations in backward to save memory
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,6 +54,9 @@ class TrainConfig:
 
     # torch.compile (PyTorch 2+ only)
     compile: bool = False
+
+    # periodic checkpoints
+    checkpoint_interval: int = 0  # save checkpoint_NNNNNN.pt every N steps (0 = disabled)
 
 
 # ---------------------------------------------------------------------------

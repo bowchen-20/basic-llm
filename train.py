@@ -172,20 +172,22 @@ for step in range(start_step, tcfg.max_iters):
                 f"{losses['train']:.4f}", f"{losses['val']:.4f}",
                 f"{last_grad_norm:.4f}",
             ])
+        ckpt_payload = {
+            "model":           model.state_dict(),
+            "optimizer":       optimizer.state_dict(),
+            "step":            step,
+            "model_config":    mcfg.to_dict(),
+            "tokenizer_state": tokenizer.get_state(),
+            "train_config":    tcfg.__dict__,
+        }
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
-            torch.save(
-                {
-                    "model":           model.state_dict(),
-                    "optimizer":       optimizer.state_dict(),
-                    "step":            step,
-                    "model_config":    mcfg.to_dict(),
-                    "tokenizer_state": tokenizer.get_state(),
-                    "train_config":    tcfg.__dict__,
-                },
-                best_path,
-            )
+            torch.save(ckpt_payload, best_path)
             print(f"  -> best val {best_val_loss:.4f}  saved {best_path}")
+        if tcfg.checkpoint_interval > 0 and step > 0 and step % tcfg.checkpoint_interval == 0:
+            step_path = tcfg.out_path.replace(".pt", f"_{step:06d}.pt")
+            torch.save(ckpt_payload, step_path)
+            print(f"  -> periodic checkpoint saved {step_path}")
 
     optimizer.zero_grad(set_to_none=True)
     for _ in range(tcfg.grad_accum_steps):
