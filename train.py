@@ -4,7 +4,7 @@ import os
 import time
 import torch
 from tokenizer import CharTokenizer, BPETokenizer
-from model import TransformerLM
+from model import TransformerLM, ModelEMA
 from config import ModelConfig, TrainConfig
 from data import build_datasets, make_loader
 
@@ -112,12 +112,13 @@ scaler = torch.amp.GradScaler(enabled=USE_AMP)
 # Resume from checkpoint if one exists
 # ---------------------------------------------------------------------------
 start_step = 0
+_resumed_ckpt = None
 if os.path.exists(tcfg.out_path):
     print(f"Resuming from {tcfg.out_path} ...")
-    ckpt = torch.load(tcfg.out_path, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    start_step = ckpt.get("step", 0) + 1
+    _resumed_ckpt = torch.load(tcfg.out_path, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(_resumed_ckpt["model"])
+    optimizer.load_state_dict(_resumed_ckpt["optimizer"])
+    start_step = _resumed_ckpt.get("step", 0) + 1
     print(f"Resumed at step {start_step}")
 else:
     print(f"Parameters: {model.num_params():,}  |  device: {DEVICE}  |  dtype: {tcfg.dtype}")
@@ -125,6 +126,14 @@ else:
 if tcfg.compile and hasattr(torch, "compile"):
     model = torch.compile(model)
     print("torch.compile() enabled")
+
+ema: ModelEMA | None = None
+if tcfg.ema_decay > 0:
+    if _resumed_ckpt is not None and "ema" in _resumed_ckpt:
+        ema = ModelEMA.from_state(model, _resumed_ckpt["ema"])
+    else:
+        ema = ModelEMA(model, tcfg.ema_decay)
+    print(f"EMA: decay={tcfg.ema_decay}")
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -156,7 +165,10 @@ for step in range(start_step, tcfg.max_iters):
         pg["lr"] = lr
 
     if step % tcfg.eval_interval == 0:
+        _backup = ema.apply(model) if ema is not None else None
         losses = estimate_loss(model)
+        if _backup is not None:
+            ema.restore(model, _backup)
         elapsed = time.time() - t0
         steps_done = max(1, step - start_step)
         eta_mins = (tcfg.max_iters - step) * (elapsed / steps_done) / 60
@@ -180,6 +192,8 @@ for step in range(start_step, tcfg.max_iters):
             "tokenizer_state": tokenizer.get_state(),
             "train_config":    tcfg.__dict__,
         }
+        if ema is not None:
+            ckpt_payload["ema"] = ema.get_state()
         if losses["val"] < best_val_loss:
             best_val_loss = losses["val"]
             torch.save(ckpt_payload, best_path)
@@ -201,6 +215,8 @@ for step in range(start_step, tcfg.max_iters):
     last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip).item()
     scaler.step(optimizer)
     scaler.update()
+    if ema is not None:
+        ema.update(model)
 
 # ---------------------------------------------------------------------------
 # Checkpoint

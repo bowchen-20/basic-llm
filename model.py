@@ -91,6 +91,15 @@ def make_mlp(cfg: ModelConfig) -> nn.Module:
     return SwiGLUMLP(cfg) if cfg.use_swiglu else GeLUMLP(cfg)
 
 
+def drop_path(x: torch.Tensor, drop_rate: float, training: bool) -> torch.Tensor:
+    """Stochastic depth: randomly zero entire samples per residual branch."""
+    if drop_rate == 0.0 or not training:
+        return x
+    keep = 1.0 - drop_rate
+    mask = torch.rand(x.shape[0], 1, 1, device=x.device) < keep
+    return x * mask.float() / keep
+
+
 # ---------------------------------------------------------------------------
 # Causal self-attention with KV-cache + optional RoPE + Flash Attention
 # ---------------------------------------------------------------------------
@@ -167,12 +176,13 @@ class CausalSelfAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, drop_path_rate: float = 0.0):
         super().__init__()
         self.ln1  = make_norm(cfg.n_embd, cfg)
         self.attn = CausalSelfAttention(cfg)
         self.ln2  = make_norm(cfg.n_embd, cfg)
         self.mlp  = make_mlp(cfg)
+        self.drop_path_rate = drop_path_rate
 
     def forward(
         self,
@@ -184,8 +194,8 @@ class TransformerBlock(nn.Module):
         attn_out, present_kv = self.attn(
             self.ln1(x), freqs_cis=freqs_cis, past_kv=past_kv, use_cache=use_cache
         )
-        x = x + attn_out
-        x = x + self.mlp(self.ln2(x))
+        x = x + drop_path(attn_out, self.drop_path_rate, self.training)
+        x = x + drop_path(self.mlp(self.ln2(x)), self.drop_path_rate, self.training)
         return x, present_kv
 
 
@@ -209,7 +219,10 @@ class TransformerLM(nn.Module):
         else:
             self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
 
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layer)])
+        # Linearly increase drop-path rate from 0 to cfg.drop_path_rate across layers,
+        # as in the original Stochastic Depth paper (Huang et al. 2016).
+        dpr = torch.linspace(0, cfg.drop_path_rate, cfg.n_layer).tolist()
+        self.blocks = nn.ModuleList([TransformerBlock(cfg, dpr[i]) for i in range(cfg.n_layer)])
         self.ln_f   = make_norm(cfg.n_embd, cfg)
         self.head   = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight   # weight tying
@@ -409,3 +422,56 @@ class BigramLM(nn.Module):
             logits, _ = self(x)
             x = torch.cat([x, torch.multinomial(F.softmax(logits[:, -1, :], dim=-1), 1)], dim=1)
         return x
+
+
+# ---------------------------------------------------------------------------
+# Exponential Moving Average of model weights
+# ---------------------------------------------------------------------------
+
+class ModelEMA:
+    """
+    Maintains a shadow copy of model parameters updated as an exponential
+    moving average after every optimizer step.
+
+    EMA weights tend to generalise slightly better than the raw last checkpoint
+    because they smooth out the noise inherent in stochastic gradient updates.
+    Call update() after every optimiser step, then use apply()/restore() to
+    temporarily swap in the EMA weights for evaluation.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            name: p.data.clone() for name, p in model.named_parameters()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, p in model.named_parameters():
+            self.shadow[name].mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+
+    def apply(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Copy EMA weights into model; return original weights for restore()."""
+        backup = {name: p.data.clone() for name, p in model.named_parameters()}
+        for name, p in model.named_parameters():
+            p.data.copy_(self.shadow[name])
+        return backup
+
+    def restore(self, model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        """Put original weights back after apply()."""
+        for name, p in model.named_parameters():
+            p.data.copy_(backup[name])
+
+    def get_state(self) -> dict:
+        return {
+            "decay":  self.decay,
+            "shadow": {k: v.cpu() for k, v in self.shadow.items()},
+        }
+
+    @classmethod
+    def from_state(cls, model: nn.Module, state: dict) -> "ModelEMA":
+        ema = cls.__new__(cls)
+        ema.decay = state["decay"]
+        device = next(model.parameters()).device
+        ema.shadow = {k: v.to(device) for k, v in state["shadow"].items()}
+        return ema

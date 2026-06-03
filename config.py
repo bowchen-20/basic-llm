@@ -14,6 +14,7 @@ class ModelConfig:
     use_swiglu:  bool  = True   # SwiGLU MLP (vs GELU)
     n_kv_head:   int   = 0      # 0 = n_head (standard MHA); set smaller for GQA
     use_grad_checkpoint: bool = False  # recompute activations in backward to save memory
+    drop_path_rate:      float = 0.0   # stochastic depth; linearly scaled across layers
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -57,6 +58,9 @@ class TrainConfig:
 
     # periodic checkpoints
     checkpoint_interval: int = 0  # save checkpoint_NNNNNN.pt every N steps (0 = disabled)
+
+    # exponential moving average of model weights
+    ema_decay: float = 0.0  # 0 = disabled; 0.9999 is a typical setting
 
 
 # ---------------------------------------------------------------------------
