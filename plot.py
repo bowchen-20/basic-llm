@@ -34,7 +34,6 @@ def ascii_plot(
     y_span = max(y_max - y_min, 1e-8)
 
     n = len(steps)
-    # Map each (series, point) to a canvas column.
     canvas = [[" "] * width for _ in range(height)]
     for _, vals, marker, color in series:
         for i, val in enumerate(vals):
@@ -45,10 +44,10 @@ def ascii_plot(
 
     for r, row_chars in enumerate(canvas):
         y_label = y_max - r / max(height - 1, 1) * y_span
-        print(f"  {y_label:6.3f} │{''.join(row_chars)}")
+        print(f"  {y_label:6.3f} |{''.join(row_chars)}")
 
     step_lo, step_hi = steps[0], steps[-1]
-    print(f"         └{'─' * width}")
+    print(f"         +-{'--' * (width // 2)}")
     print(f"           {step_lo:<{width // 2}}{step_hi:>{width // 2 - 1}} (step)")
 
 
@@ -70,8 +69,8 @@ def main() -> None:
         return
 
     series = [
-        ("train", train_l, "●", "\033[32m"),   # green
-        ("val",   val_l,   "○", "\033[33m"),   # yellow
+        ("train", train_l, "*", "\033[32m"),   # green  * = train
+        ("val",   val_l,   "o", "\033[33m"),   # yellow o = val
     ]
 
     print(f"\nLog: {args.log}  ({len(steps)} eval points)\n")
@@ -79,7 +78,7 @@ def main() -> None:
 
     print()
     for name, vals, marker, color in series:
-        best = min(vals)
+        best      = min(vals)
         best_step = steps[vals.index(best)]
         print(
             f"  {color}{marker}\033[0m {name:<6}  "
