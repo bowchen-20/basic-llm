@@ -2,11 +2,11 @@
 Inspect a checkpoint: parameter counts, weight statistics, sample output.
 
 Usage:
-    python inspect.py
-    python inspect.py --params
-    python inspect.py --stats
-    python inspect.py --sample --prompt "hello"
-    python inspect.py --checkpoint checkpoint_best.pt --params --stats
+    python inspect_model.py
+    python inspect_model.py --params
+    python inspect_model.py --stats
+    python inspect_model.py --sample --prompt "hello"
+    python inspect_model.py --checkpoint checkpoint_best.pt --params --stats
 """
 
 import argparse
