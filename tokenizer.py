@@ -5,9 +5,14 @@ from collections import defaultdict
 # Splits text into chunks before BPE runs, preventing merges across word/punctuation
 # boundaries. Keeps a leading space as part of a word token (e.g. " hello" is one
 # chunk), matching GPT-2 convention. Order matters: contractions must come first.
+#
+# The letter-run alternative is `[^\s\W\d]+` (word char, not space, not digit) rather
+# than `[a-zA-Z]+` so it captures any Unicode letter (accented Latin, CJK, Cyrillic,
+# etc.) — `[a-zA-Z]+` only matched ASCII, and since those characters are also excluded
+# from `[^\s\w]+` (they ARE \w), re.findall silently dropped them entirely.
 _PRETOK = re.compile(
     r"'s|'t|'re|'ve|'m|'ll|'d"
-    r"| ?[a-zA-Z]+"
+    r"| ?[^\s\W\d]+"
     r"| ?[0-9]+"
     r"| ?[^\s\w]+"
     r"|\s+"
